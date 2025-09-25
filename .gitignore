@@ -1,19 +1,10 @@
-# Python cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Env variables
-.env
-
-# Virtual environment
-venv/
 env/
-
-# Logs
-*.log
-
-# OS files
-.DS_Store
-Thumbs.db
+.env
+bot.log
+dist/
+build/
+*.exe

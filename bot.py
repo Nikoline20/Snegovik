@@ -2,27 +2,45 @@ import os
 import sys
 import subprocess
 import asyncio
-import requests
+import time
 import importlib.util
-from twitchio.ext import commands, routines
+import requests
+import logging
+from twitchio.ext import commands
 from dotenv import load_dotenv
 
-# Загружаем конфиг
-load_dotenv()
+# ==================== Логирование ====================
+log_file = os.path.join(os.path.abspath(os.path.dirname(sys.argv[0])), "bot.log")
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8"
+)
 
+# Дублируем в консоль для отладки
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+console.setFormatter(formatter)
+logging.getLogger("").addHandler(console)
+
+logging.info("Логирование инициализировано")
+
+# ==================== Загрузка .env ====================
+load_dotenv()
 BOT_NICK = os.getenv("TWITCH_BOT_NICK")
 CHANNEL = os.getenv("TWITCH_CHANNEL")
 TOKEN = os.getenv("TWITCH_TOKEN")
-CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
-CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 HELIX_STREAMS_URL = "https://api.twitch.tv/helix/streams"
-
 APP_TOKEN = None
 COMMANDS_DIR = "commands"
 AUTOMSG_DIR = "auto_messages"
 
-# === Получаем App Token для API ===
+# ==================== Получение App Access Token ====================
 def get_app_access_token():
     url = "https://id.twitch.tv/oauth2/token"
     params = {
@@ -32,40 +50,33 @@ def get_app_access_token():
     }
     resp = requests.post(url, params=params)
     resp.raise_for_status()
-    return resp.json()["access_token"]
+    token = resp.json()["access_token"]
+    logging.info("Получен App Access Token")
+    return token
 
-
+# ==================== Бот ====================
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(token=TOKEN, prefix="!", initial_channels=[CHANNEL])
+        self.auto_messages = []
+        self.chat_message_count = {}
 
     async def event_ready(self):
-        print(f"✅ Бот {BOT_NICK} подключился к {CHANNEL}!")
+        logging.info(f"Бот {BOT_NICK} подключился к {CHANNEL}!")
         self.load_custom_commands()
+        self.load_auto_messages()
+        asyncio.create_task(self.auto_message_loop())
+        asyncio.create_task(self.check_stream_status())
 
     async def event_message(self, message):
         if message.echo:
             return
+        # Счётчик сообщений для авто-сообщений
+        for am in self.auto_messages:
+            am['counter'] += 1
         await self.handle_commands(message)
 
-    # ==== Встроенные команды ====
-    @commands.command(name="обновить")
-    async def update_restart(self, ctx: commands.Context):
-        if ctx.author.is_mod or ctx.author.name.lower() == CHANNEL.lower():
-            await ctx.send("🔄 Проверяю обновления...")
-            try:
-                out = subprocess.check_output(["git", "pull"]).decode("utf-8")
-                if "Already up to date" in out or "Уже обновлено" in out:
-                    await ctx.send("✅ Обновлений нет, бот уже свежий.")
-                else:
-                    await ctx.send("♻️ Найдены обновления, перезапуск...")
-                    os.execv(sys.executable, ["python"] + sys.argv)
-            except Exception as e:
-                await ctx.send(f"❌ Ошибка при обновлении: {e}")
-        else:
-            await ctx.send("⛔ Только модеры или стример могут обновлять бота!")
-
-    # ==== Загрузка кастомных команд ====
+    # ==================== Кастомные команды ====================
     def load_custom_commands(self):
         if os.path.exists(COMMANDS_DIR):
             for fname in os.listdir(COMMANDS_DIR):
@@ -82,73 +93,84 @@ class Bot(commands.Bot):
 
                     if cmd_name not in self.commands:
                         self.add_command(commands.Command(name=cmd_name, func=custom_cmd))
-            print(f"📦 Загружены кастомные команды: {list(self.commands.keys())}")
+            logging.info(f"Загружены кастомные команды: {list(self.commands.keys())}")
 
+    # ==================== Авто-сообщения ====================
+    def load_auto_messages(self):
+        # Пример: интервал в секундах, min_chat_messages — количество сообщений для отправки
+        self.auto_messages = [
+            {'file': 'discord.py', 'interval': 15*60, 'min_chat_messages': 5, 'last_sent': 0, 'counter': 0},
+            {'file': 'follow.py', 'interval': 10*60, 'min_chat_messages': 3, 'last_sent': 0, 'counter': 0},
+        ]
+        logging.info(f"Загружены авто-сообщения: {[am['file'] for am in self.auto_messages]}")
 
+    async def auto_message_loop(self):
+        while True:
+            now = time.time()
+            for am in self.auto_messages:
+                if now - am['last_sent'] >= am['interval'] and am['counter'] >= am['min_chat_messages']:
+                    chan = self.get_channel(CHANNEL)
+                    if chan:
+                        spec = importlib.util.spec_from_file_location(
+                            "module.name", os.path.join(AUTOMSG_DIR, am['file'])
+                        )
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
+                        await module.run(chan)
+                        logging.info(f"Отправлено авто-сообщение {am['file']}")
+                    am['last_sent'] = now
+                    am['counter'] = 0
+            await asyncio.sleep(5)
+
+    # ==================== Команда обновления ====================
+    @commands.command(name="обновить")
+    async def update_restart(self, ctx: commands.Context):
+        if ctx.author.is_mod or ctx.author.name.lower() == CHANNEL.lower():
+            await ctx.send("🔄 Проверяю обновления...")
+            try:
+                out = subprocess.check_output(["git", "pull"]).decode("utf-8")
+                if "Already up to date" in out or "Уже обновлено" in out:
+                    await ctx.send("✅ Обновлений нет, бот уже свежий.")
+                else:
+                    await ctx.send("♻️ Найдены обновления, перезапуск...")
+                    logging.info("Перезапуск бота после обновления")
+                    os.execv(sys.executable, ["python"] + sys.argv)
+            except Exception as e:
+                await ctx.send(f"❌ Ошибка при обновлении: {e}")
+                logging.error(f"Ошибка при обновлении: {e}")
+        else:
+            await ctx.send("⛔ Только модеры или стример могут обновлять бота!")
+
+    # ==================== Проверка статуса стрима ====================
+    async def check_stream_status(self):
+        global APP_TOKEN
+        while True:
+            if not APP_TOKEN:
+                try:
+                    APP_TOKEN = get_app_access_token()
+                except Exception as e:
+                    logging.error(f"Ошибка получения App Token: {e}")
+                    await asyncio.sleep(60)
+                    continue
+
+            headers = {
+                "Client-ID": CLIENT_ID,
+                "Authorization": f"Bearer {APP_TOKEN}"
+            }
+            params = {"user_login": CHANNEL}
+            try:
+                resp = requests.get(HELIX_STREAMS_URL, headers=headers, params=params)
+                data = resp.json()
+                if "data" in data and len(data["data"]) > 0:
+                    logging.info("Стрим запущен!")
+                else:
+                    logging.info("Стрим не идёт")
+            except Exception as e:
+                logging.error(f"Ошибка при проверке стрима: {e}")
+            await asyncio.sleep(60)
+
+# ==================== Запуск бота ====================
 bot = Bot()
 
-# ==== Автоматические сообщения ====
-auto_messages_list = []
-if os.path.exists(AUTOMSG_DIR):
-    for fname in os.listdir(AUTOMSG_DIR):
-        if fname.endswith(".py"):
-            auto_messages_list.append(fname)
-
-
-@routines.routine(minutes=10)
-async def auto_message():
-    if auto_messages_list:
-        chan = bot.get_channel(CHANNEL)
-        if chan:
-            fname = auto_messages_list.pop(0)
-            spec = importlib.util.spec_from_file_location(
-                "module.name", os.path.join(AUTOMSG_DIR, fname)
-            )
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            await module.run(chan)
-            auto_messages_list.append(fname)
-
-
-# ==== Проверка статуса стрима ====
-async def check_stream_status():
-    global APP_TOKEN
-    while True:
-        if not APP_TOKEN:
-            try:
-                APP_TOKEN = get_app_access_token()
-            except Exception as e:
-                print("Ошибка получения App Token:", e)
-                await asyncio.sleep(60)
-                continue
-
-        headers = {
-            "Client-ID": CLIENT_ID,
-            "Authorization": f"Bearer {APP_TOKEN}"
-        }
-        params = {"user_login": CHANNEL}
-        try:
-            resp = requests.get(HELIX_STREAMS_URL, headers=headers, params=params)
-            data = resp.json()
-            if "data" in data and len(data["data"]) > 0:
-                print("🔴 Стрим запущен!")
-                if not auto_message.is_running():
-                    auto_message.start()
-            else:
-                print("⚫ Стрим не идёт")
-                if auto_message.is_running():
-                    auto_message.stop()
-        except Exception as e:
-            print("Ошибка при проверке стрима:", e)
-
-        await asyncio.sleep(60)
-
-
-# ==== Основной запуск ====
-async def main():
-    asyncio.create_task(check_stream_status())
-    await bot.start()
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    bot.run()
