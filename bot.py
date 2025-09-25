@@ -1,24 +1,31 @@
 import os
 import sys
-import subprocess
 import asyncio
 import time
 import importlib.util
-import requests
+import subprocess
 import logging
+from logging.handlers import TimedRotatingFileHandler
+import requests
 from twitchio.ext import commands
 from dotenv import load_dotenv
 
 # ==================== Логирование ====================
-log_file = os.path.join(os.path.abspath(os.path.dirname(sys.argv[0])), "bot.log")
+base_dir = os.path.abspath(os.path.dirname(sys.argv[0]))
+log_dir = os.path.join(base_dir, "logs")
+os.makedirs(log_dir, exist_ok=True)
+
+log_file = os.path.join(log_dir, "bot.log")
+
+handler = TimedRotatingFileHandler(
+    log_file, when="D", interval=1, backupCount=7, encoding="utf-8"
+)
 logging.basicConfig(
-    filename=log_file,
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    encoding="utf-8"
+    handlers=[handler]
 )
 
-# Дублируем в консоль для отладки
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -40,7 +47,7 @@ APP_TOKEN = None
 COMMANDS_DIR = "commands"
 AUTOMSG_DIR = "auto_messages"
 
-# ==================== Получение App Access Token ====================
+# ==================== Получение App Token ====================
 def get_app_access_token():
     url = "https://id.twitch.tv/oauth2/token"
     params = {
@@ -54,7 +61,10 @@ def get_app_access_token():
     logging.info("Получен App Access Token")
     return token
 
-# ==================== Бот ====================
+# ==================== Импорт авто-сообщений ====================
+from auto_messages_config import load_auto_messages  # функция возвращает список словарей
+
+# ==================== Класс бота ====================
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(token=TOKEN, prefix="!", initial_channels=[CHANNEL])
@@ -63,15 +73,15 @@ class Bot(commands.Bot):
 
     async def event_ready(self):
         logging.info(f"Бот {BOT_NICK} подключился к {CHANNEL}!")
+        self.auto_messages = load_auto_messages()
+        logging.info(f"Загружены авто-сообщения: {[am['file'] for am in self.auto_messages]}")
         self.load_custom_commands()
-        self.load_auto_messages()
         asyncio.create_task(self.auto_message_loop())
         asyncio.create_task(self.check_stream_status())
 
     async def event_message(self, message):
         if message.echo:
             return
-        # Счётчик сообщений для авто-сообщений
         for am in self.auto_messages:
             am['counter'] += 1
         await self.handle_commands(message)
@@ -96,14 +106,6 @@ class Bot(commands.Bot):
             logging.info(f"Загружены кастомные команды: {list(self.commands.keys())}")
 
     # ==================== Авто-сообщения ====================
-    def load_auto_messages(self):
-        # Пример: интервал в секундах, min_chat_messages — количество сообщений для отправки
-        self.auto_messages = [
-            {'file': 'discord.py', 'interval': 15*60, 'min_chat_messages': 5, 'last_sent': 0, 'counter': 0},
-            {'file': 'follow.py', 'interval': 10*60, 'min_chat_messages': 3, 'last_sent': 0, 'counter': 0},
-        ]
-        logging.info(f"Загружены авто-сообщения: {[am['file'] for am in self.auto_messages]}")
-
     async def auto_message_loop(self):
         while True:
             now = time.time()
