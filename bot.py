@@ -1,266 +1,422 @@
+# bot.py
 import os
 import time
 import asyncio
 import logging
 import importlib.util
-import inspect
-import twitchAPI
 from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 from twitchio.ext import commands
-from twitchAPI.twitch import Twitch
+import aiohttp
+import inspect
 
 # ========== Настройки ==========
 load_dotenv()
-TOKEN = os.getenv("TWITCH_TOKEN")
+TOKEN = os.getenv("TOKEN")                # oauth:...
+CHANNEL = os.getenv("CHANNEL")            # имя канала без #
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-CHANNEL = os.getenv("TWITCH_CHANNEL")
 
 COMMANDS_DIR = "commands"
-AUTOMSG_DIR = "automsg"
+AUTOMSG_DIR = "auto_messages"
 LOGS_DIR = "logs"
+
+COMMAND_COOLDOWN = 2  # секунд
 
 # ========== Логи ==========
 os.makedirs(LOGS_DIR, exist_ok=True)
 log_file = os.path.join(LOGS_DIR, "bot.log")
-handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[handler, logging.StreamHandler()]
 )
 
+# ========== Helix helpers (aiohttp) ==========
+async def get_app_access_token(session):
+    """
+    Получает App Access Token (client_credentials).
+    Возвращает (token, expires_in) или (None, 0) при ошибке.
+    """
+    url = "https://id.twitch.tv/oauth2/token"
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "client_credentials"
+    }
+    try:
+        async with session.post(url, data=data) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                logging.error(f"Ошибка получения App Token: HTTP {resp.status} — {text}")
+                return None, 0
+            js = await resp.json()
+            token = js.get("access_token")
+            expires = int(js.get("expires_in", 0))
+            logging.info("Получен App Access Token")
+            return token, expires
+    except Exception as e:
+        logging.exception(f"Исключение при запросе App Token: {e}")
+        return None, 0
+
+
+async def helix_is_stream_live(session, app_token, channel_name):
+    """
+    Возвращает True/False или None при ошибке.
+    """
+    url = "https://api.twitch.tv/helix/streams"
+    headers = {"Client-ID": CLIENT_ID, "Authorization": f"Bearer {app_token}"}
+    params = {"user_login": channel_name}
+    try:
+        async with session.get(url, headers=headers, params=params) as resp:
+            text = await resp.text()
+            if resp.status == 401:
+                logging.warning(f"Helix 401: токен недействителен или нет прав: {text}")
+                return None
+            if resp.status >= 400:
+                logging.error(f"Helix запрос вернул HTTP {resp.status}: {text}")
+                return None
+            js = await resp.json()
+            data = js.get("data", [])
+            return len(data) > 0
+    except Exception as e:
+        logging.exception(f"Ошибка запроса Helix streams: {e}")
+        return None
+
+
 # ========== Бот ==========
 class Bot(commands.Bot):
     def __init__(self):
+        if not TOKEN or not CHANNEL:
+            logging.error("TOKEN или CHANNEL не установлены в .env — бот не запустится.")
+            raise SystemExit("TOKEN или CHANNEL отсутствуют")
+
         super().__init__(token=TOKEN, prefix="!", initial_channels=[CHANNEL])
+
+        # команды
         self.custom_command_files = {}
+        self._last_command_keys = set()
+
+        # авто-сообщения (загрузится через конфиг)
         self.auto_messages = []
-        self.ensure_dirs()
-        self.scan_command_files()
-        self.load_auto_messages_config()
 
-        # API Twitch
-        self.twitch = Twitch(CLIENT_ID, CLIENT_SECRET)
+        # Twitch app token cache
+        self.app_token = None
+        self.app_token_expire_at = 0  # epoch
+
+        # session создаём в event_ready (чтобы избежать RuntimeError)
+        self.session = None
+
+        # stream state
         self.stream_online = False
+        self.last_stream_state = None
 
-        # Ограничение команд
-        self.cooldowns = {}
+        # cooldowns
+        self.cooldowns = {}  # username -> timestamp
 
-    def ensure_dirs(self):
+        # main channel fallback (заполняется при первом сообщении)
+        self.main_channel = None
+
+        # ensure dirs, load commands/auto messages metadata
         os.makedirs(COMMANDS_DIR, exist_ok=True)
         os.makedirs(AUTOMSG_DIR, exist_ok=True)
+        self.scan_command_files()
+        # НЕ вызываем загрузку авто-сообщений здесь — делаем это в event_ready
+        # self.load_auto_messages_config()
 
-    # Сканируем папку commands/
+    # ---------- commands scanning ----------
     def scan_command_files(self):
-        new_command_files = {}
+        new = {}
         for fname in os.listdir(COMMANDS_DIR):
             if fname.endswith(".py"):
                 name = fname[:-3]
-                path = os.path.join(COMMANDS_DIR, fname)
-                new_command_files[name] = path
+                new[name] = os.path.join(COMMANDS_DIR, fname)
+        new_keys = set(new.keys())
+        if new_keys != self._last_command_keys:
+            logging.info(f"Найдено кастомных команд: {sorted(list(new_keys))}")
+            self._last_command_keys = new_keys
+        self.custom_command_files = new
 
-        # Логируем только если список изменился
-        if set(new_command_files.keys()) != set(self.custom_command_files.keys()):
-            logging.info(f"Найдено кастомных команд: {list(new_command_files.keys())}")
-
-        self.custom_command_files = new_command_files
-
-    # Загружаем авто-сообщения
+    # ---------- load auto messages ----------
     def load_auto_messages_config(self):
         try:
             import auto_messages_config as cfg
-            self.auto_messages = []
-            for am in getattr(cfg, "AUTO_MESSAGES", []):
-                entry = am.copy()
-                entry.setdefault("last_sent", 0)
-                entry.setdefault("counter", 0)
-                self.auto_messages.append(entry)
+            load = getattr(cfg, "load_auto_messages", None)
+            if callable(load):
+                self.auto_messages = load()
+            else:
+                self.auto_messages = getattr(cfg, "AUTO_MESSAGES", [])
+                for am in self.auto_messages:
+                    am.setdefault("last_sent", 0)
+                    am.setdefault("counter", 0)
             logging.info(f"Загружены авто-сообщения: {[a['file'] for a in self.auto_messages]}")
         except Exception as e:
-            logging.warning(f"auto_messages_config.py не загружен: {e}")
+            logging.warning(f"auto_messages_config не загружен: {e}")
             self.auto_messages = []
 
-    # ================= События =================
+    # ---------- lifecycle ----------
     async def event_ready(self):
-        logging.info(f"Бот готов: {self.nick} -> канал: {CHANNEL}")
-        asyncio.create_task(self.periodic_scan_commands())
-        asyncio.create_task(self.auto_message_loop())
-        asyncio.create_task(self.stream_status_checker())
+        logging.info(f"Bot ready: {self.nick} -> {CHANNEL}")
 
-    async def periodic_scan_commands(self):
+        # создаём session здесь — уже есть running loop
+        if self.session is None or getattr(self.session, "closed", True):
+            self.session = aiohttp.ClientSession()
+
+        # загрузим авто-сообщения из конфига
+        self.load_auto_messages_config()
+
+        # периодические задачи
+        asyncio.create_task(self._periodic_scan_commands())
+        asyncio.create_task(self._auto_message_loop())
+        asyncio.create_task(self._stream_status_loop())
+
+    async def event_close(self):
+        """Закрытие aiohttp при завершении"""
+        if self.session and not self.session.closed:
+            await self.session.close()
+        logging.info("aiohttp.ClientSession закрыт")
+
+    async def _periodic_scan_commands(self):
         while True:
             try:
                 self.scan_command_files()
             except Exception as e:
-                logging.error(f"Ошибка при сканировании команд: {e}")
-            await asyncio.sleep(10)
+                logging.exception(f"Ошибка сканирования команд: {e}")
+            await asyncio.sleep(30)
 
+    # ---------- messages ----------
     async def event_message(self, message):
-        if message.echo or not self.stream_online:
+        # не обрабатываем собственные сообщения
+        if message.echo:
             return
 
-        # Ограничение команд
-        user = message.author.name
-        now = time.time()
-        if user in self.cooldowns and now - self.cooldowns[user] < 2:
-            return
-        self.cooldowns[user] = now
+        # запомним main_channel (фолбэк для авто-писем)
+        if not self.main_channel:
+            try:
+                self.main_channel = message.channel
+            except Exception:
+                self.main_channel = None
 
-        # Считаем сообщения для авто-сообщений
+        # считаем сообщения для авто-сообщений (нужно для min_chat_messages)
         for am in self.auto_messages:
-            am['counter'] += 1
+            am['counter'] = am.get('counter', 0) + 1
 
-        # Кастомные команды
-        if message.content.startswith("!"):
-            cmd_name = message.content.split()[0][1:]
-            if cmd_name in self.custom_command_files:
-                await self.run_custom_command(cmd_name, message)
-                return
+        # обработка команды (начинается с "!")
+        content = (message.content or "").strip()
+        if not content.startswith("!"):
+            # позволяем twitchio обрабатывать прочее
+            await self.handle_commands(message)
+            return
 
+        username = message.author.name.lower()
+        now = time.time()
+        last = self.cooldowns.get(username, 0)
+        if now - last < COMMAND_COOLDOWN:
+            logging.info(f"Игнорируем команду от {username} — cooldown ({now-last:.2f}s)")
+            return
+        self.cooldowns[username] = now
+
+        cmd_name = content.split()[0][1:]
+        if cmd_name in self.custom_command_files:
+            await self.run_custom_command(cmd_name, message)
+            return
+
+        # иначе даём handle_commands (если есть зарегистрированная команда)
         await self.handle_commands(message)
 
-    # ========== Выполнение кастомной команды ==========
+    # ---------- выполнение кастомной команды ----------
     async def run_custom_command(self, cmd_name, message):
         path = self.custom_command_files.get(cmd_name)
-        if not path or not os.path.exists(path):
-            logging.warning(f"Команда {cmd_name} не найдена: {path}")
+        if not path:
+            logging.warning(f"Команда {cmd_name} не найдена (path пустой).")
+            return
+        if not os.path.exists(path):
+            logging.warning(f"Файл команды {path} не найден.")
             return
 
         try:
-            spec = importlib.util.spec_from_file_location(f"commands.{cmd_name}", path)
+            # Импортируем модуль динамически (чтобы сразу видеть изменения)
+            spec = importlib.util.spec_from_file_location(f"commands.{cmd_name}_{int(time.time())}", path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
         except Exception as e:
-            logging.error(f"Ошибка загрузки команды {cmd_name}: {e}")
-            await message.channel.send(f"Ошибка загрузки команды {cmd_name}")
+            logging.exception(f"Ошибка при загрузке команды {cmd_name}: {e}")
+            try:
+                await message.channel.send(f"Ошибка загрузки команды {cmd_name}")
+            except Exception:
+                pass
             return
 
-        if not hasattr(module, "run"):
-            logging.error(f"В модуле {cmd_name} нет функции run")
-            await message.channel.send(f"Команда {cmd_name} некорректна (нет run)")
+        func = getattr(module, "run", None)
+        if not func:
+            logging.warning(f"В модуле {cmd_name} нет функции run")
             return
 
-        func = module.run
-        sig = inspect.signature(func)
-        params = list(sig.parameters.values())
-        nparams = len(params)
-
-        ctx = None
-        if nparams >= 1:
-            if params[0].name.lower() in ("ctx", "context"):
-                ctx = await self.get_context(message)
-
+        # предпочитаем ctx (Context), но если команда написана иначе — пробуем message
         try:
-            if asyncio.iscoroutinefunction(func):
-                if nparams == 2:
-                    if ctx:
-                        await func(self, ctx)
-                    else:
-                        await func(self, message)
-                elif nparams == 1:
-                    if ctx:
-                        await func(ctx)
-                    else:
-                        await func(message)
-                else:
-                    await func()
+            ctx = await self.get_context(message)
+            if inspect.iscoroutinefunction(func):
+                await func(ctx)
             else:
-                if nparams == 2:
-                    if ctx:
-                        res = func(self, ctx)
-                    else:
-                        res = func(self, message)
-                elif nparams == 1:
-                    if ctx:
-                        res = func(ctx)
-                    else:
-                        res = func(message)
-                else:
-                    res = func()
+                res = func(ctx)
                 if inspect.isawaitable(res):
                     await res
+        except TypeError:
+            logging.info(f"run(ctx) не подошёл для {cmd_name}, пробуем run(message)")
+            try:
+                if inspect.iscoroutinefunction(func):
+                    await func(message)
+                else:
+                    res = func(message)
+                    if inspect.isawaitable(res):
+                        await res
+            except Exception as e:
+                logging.exception(f"Ошибка выполнения команды {cmd_name}: {e}")
+                try:
+                    await message.channel.send(f"Ошибка в команде {cmd_name}")
+                except Exception:
+                    pass
         except Exception as e:
-            logging.exception(f"Ошибка в выполнении команды {cmd_name}: {e}")
+            logging.exception(f"Ошибка выполнения команды {cmd_name}: {e}")
             try:
                 await message.channel.send(f"Ошибка в команде {cmd_name}: {e}")
             except Exception:
                 pass
 
-    # ================= Авто-сообщения =================
-    async def auto_message_loop(self):
+    # ---------- авто-сообщения ----------
+    def _get_send_channel(self):
+        """
+        Попытка найти рабочий Channel для отправки сообщений:
+        1) self.get_channel(CHANNEL)
+        2) первый из self.connected_channels
+        3) self.main_channel (заполнится в event_message)
+        """
+        try:
+            ch = self.get_channel(CHANNEL)
+            if ch:
+                return ch
+        except Exception:
+            pass
+        try:
+            if getattr(self, "connected_channels", None):
+                if len(self.connected_channels) > 0:
+                    return self.connected_channels[0]
+        except Exception:
+            pass
+        return getattr(self, "main_channel", None)
+
+    async def _auto_message_loop(self):
+        # конфиг уже загружен в event_ready, но подстрахуемся
+        if not self.auto_messages:
+            self.load_auto_messages_config()
+
         while True:
-            if self.stream_online:
-                now = time.time()
-                for am in self.auto_messages:
-                    try:
-                        interval = am.get("interval", 600)
-                        last = am.get("last_sent", 0)
-                        counter = am.get("counter", 0)
-                        min_chat = am.get("min_chat_messages", 0)
+            # авто-сообщения только если стрим онлайн
+            if not self.stream_online:
+                await asyncio.sleep(5)
+                continue
 
-                        if now - last >= interval and counter >= min_chat:
-                            chan = self.get_channel(CHANNEL)
-                            if chan:
-                                path = os.path.join(AUTOMSG_DIR, am['file'])
-                                if os.path.exists(path):
-                                    try:
-                                        spec = importlib.util.spec_from_file_location(f"automsg.{am['file']}", path)
-                                        module = importlib.util.module_from_spec(spec)
-                                        spec.loader.exec_module(module)
-                                        if hasattr(module, "run"):
-                                            if asyncio.iscoroutinefunction(module.run):
-                                                await module.run(chan)
-                                            else:
-                                                res = module.run(chan)
-                                                if inspect.isawaitable(res):
-                                                    await res
-                                            logging.info(f"Отправлено авто-сообщение {am['file']}")
-                                        else:
-                                            logging.warning(f"Авто-файл {am['file']} не содержит run(chan)")
-                                    except Exception as e:
-                                        logging.exception(f"Ошибка авто-сообщения {am['file']}: {e}")
-                                else:
-                                    logging.warning(f"Файл авто-сообщения {am['file']} не найден: {path}")
-
-                            am['last_sent'] = now
-                            am['counter'] = 0
-                    except Exception as e:
-                        logging.exception(f"Ошибка в авто-сообщении: {e}")
+            now = time.time()
+            for am in self.auto_messages:
+                try:
+                    interval = am.get("interval", 600)
+                    last_sent = am.get("last_sent", 0)
+                    min_chat = am.get("min_chat_messages", 0)
+                    counter = am.get("counter", 0)
+                    if now - last_sent >= interval and counter >= min_chat:
+                        chan = self._get_send_channel()
+                        if chan:
+                            p = os.path.join(AUTOMSG_DIR, am["file"])
+                            if os.path.exists(p):
+                                # импортируем файл авто-сообщения динамически
+                                module_name = f"auto_msg_{os.path.splitext(am['file'])[0]}_{int(now)}"
+                                spec = importlib.util.spec_from_file_location(module_name, p)
+                                module = importlib.util.module_from_spec(spec)
+                                spec.loader.exec_module(module)
+                                runfn = getattr(module, "run", None)
+                                if runfn:
+                                    if inspect.iscoroutinefunction(runfn):
+                                        await runfn(chan)
+                                    else:
+                                        res = runfn(chan)
+                                        if inspect.isawaitable(res):
+                                            await res
+                                    logging.info(f"Отправлено авто-сообщение {am['file']}")
+                            else:
+                                logging.warning(f"Авто-файл не найден: {p}")
+                        am["last_sent"] = now
+                        am["counter"] = 0
+                except Exception as e:
+                    logging.exception(f"Ошибка при обработке авто-сообщения {am.get('file')}: {e}")
             await asyncio.sleep(5)
 
-    # ================= Проверка статуса стрима =================
-    async def stream_status_checker(self):
-        chan = self.get_channel(CHANNEL)
+    # ---------- проверка статуса стрима ----------
+    async def _ensure_app_token(self):
+        # создаём session, если потребуется (в безопасном месте — уже в async)
+        if self.session is None or getattr(self.session, "closed", True):
+            self.session = aiohttp.ClientSession()
+
+        if not CLIENT_ID or not CLIENT_SECRET:
+            logging.warning("CLIENT_ID/CLIENT_SECRET не заданы — проверка стрима отключена.")
+            return False
+
+        now = time.time()
+        if self.app_token and now < self.app_token_expire_at - 30:
+            return True
+
+        token, expires = await get_app_access_token(self.session)
+        if token:
+            self.app_token = token
+            self.app_token_expire_at = now + max(10, int(expires))
+            return True
+        return False
+
+    async def _stream_status_loop(self):
+        # initial quick check to avoid long wait
+        # и затем цикл
         while True:
             try:
-                user_info = await self.twitch.get_users(logins=[CHANNEL])
-                if not user_info["data"]:
+                ok = await self._ensure_app_token()
+                if not ok:
                     await asyncio.sleep(60)
                     continue
 
-                user_id = user_info["data"][0]["id"]
-                stream = await self.twitch.get_streams(user_id=user_id)
+                live = await helix_is_stream_live(self.session, self.app_token, CHANNEL)
+                if live is None:
+                    # ошибка — освободим токен и повторим через короткий промежуток
+                    self.app_token = None
+                    await asyncio.sleep(15)
+                    continue
 
-                if stream["data"] and not self.stream_online:
-                    # Стрим начался
+                # смена статуса
+                if live and not self.stream_online:
                     self.stream_online = True
-                    logging.info("Стрим начался")
+                    logging.info("Стрим начался (детект).")
+                    chan = self._get_send_channel()
                     if chan:
-                        await chan.send("Теперь я тоже смотрю стрим 👀")
+                        try:
+                            await chan.send("Теперь я тоже смотрю стрим!")
+                        except Exception:
+                            pass
 
-                elif not stream["data"] and self.stream_online:
-                    # Стрим закончился
+                elif not live and self.stream_online:
                     self.stream_online = False
-                    logging.info("Стрим завершился")
+                    logging.info("Стрим завершён (детект).")
+                    chan = self._get_send_channel()
                     if chan:
-                        await chan.send("Теперь мне нечего смотреть 😔")
+                        try:
+                            await chan.send("Стрим закончился, мне больше нечего смотреть...")
+                        except Exception:
+                            pass
+
+                # сохраняем в last_stream_state
+                self.last_stream_state = bool(live)
 
             except Exception as e:
-                logging.error(f"Ошибка при проверке статуса стрима: {e}")
+                logging.exception(f"Ошибка в loop проверки стрима: {e}")
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
 
 # ========== Запуск ==========
