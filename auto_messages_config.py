@@ -5,9 +5,9 @@
 import time
 
 auto_messages = [
-    {'file': 'discord_tg.py', 'interval': 15 * 60, 'min_chat_messages': 5},
-    {'file': 'команды.py', 'interval': 10 * 60, 'min_chat_messages': 3},
-    {'file': 'info.py', 'interval': 10 * 60, 'min_chat_messages': 3},
+    {'file': 'discord_tg.py', 'interval': 30 * 60, 'min_chat_messages': 6},
+    {'file': 'команды.py', 'interval': 25 * 60, 'min_chat_messages': 5},
+    {'file': 'info.py', 'interval': 21 * 60, 'min_chat_messages': 5},
 ]
 
 
