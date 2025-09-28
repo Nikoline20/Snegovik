@@ -1,61 +1,91 @@
 import aiohttp
 import datetime
 import os
+import logging
 
-CHANNEL = os.getenv("CHANNEL")  # чтобы взять имя из .env
+CHANNEL = os.getenv("CHANNEL")
+CLIENT_ID = os.getenv("CLIENT_ID")
+USER_OAUTH = os.getenv("USER_OAUTH")  # токен со scope moderator:read:followers
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 async def run(ctx):
-    bot = ctx.bot  # доступ к боту
+    bot = ctx.bot
     session = bot.session
-    app_token = bot.app_token
-    client_id = os.getenv("CLIENT_ID")
 
-    if not app_token:
-        await ctx.send("Не могу проверить фолловеров: токен ещё не получен.")
+    if not USER_OAUTH:
+        await ctx.send("Нет токена USER_OAUTH в .env (нужен scope moderator:read:followers).")
         return
+
+    headers = {
+        "Client-ID": CLIENT_ID,
+        "Authorization": f"Bearer {USER_OAUTH}"
+    }
 
     user = ctx.author.name
 
-    # сначала получаем user_id по имени
-    url_users = "https://api.twitch.tv/helix/users"
-    headers = {
-        "Client-ID": client_id,
-        "Authorization": f"Bearer {app_token}"
-    }
+    async def get_app_access_token(session):
+        """
+        Получает App Access Token (client_credentials).
+        Возвращает (token, expires_in) или (None, 0) при ошибке.
+        """
+        url = "https://id.twitch.tv/oauth2/authorize"
+        data = {
+            "client_id": CLIENT_ID,
+            "redirect_uri": "http://localhost:3000",
+            "response_type": token,
+            "scope": "moderator:read:followers"
+        }
+        try:
+            async with session.post(url, data=data) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    logging.error(f"Ошибка получения App Token: HTTP {resp.status} — {text}")
+                    return None, 0
+                js = await resp.json()
+                token = js.get("access_token")
+                expires = int(js.get("expires_in", 0))
+                logging.info("Получен App Access Token")
+                return token, expires
+        except Exception as e:
+            logging.exception(f"Исключение при запросе App Token: {e}")
+            return None, 0
 
+    # --- получаем user_id зрителя ---
+    url_users = "https://api.twitch.tv/helix/users"
     async with session.get(url_users, headers=headers, params={"login": user}) as resp:
-        if resp.status != 200:
-            await ctx.send("Ошибка при получении данных пользователя.")
-            return
         js = await resp.json()
+        if resp.status != 200:
+            await ctx.send(f"Ошибка при получении данных пользователя: {js}")
+            return
         if not js.get("data"):
-            await ctx.send("Не нашёл пользователя в Twitch API.")
+            await ctx.send("Не нашёл пользователя.")
             return
         user_id = js["data"][0]["id"]
 
-    # получаем id канала (чтобы проверить follow)
+    # --- получаем broadcaster_id канала ---
     async with session.get(url_users, headers=headers, params={"login": CHANNEL}) as resp:
-        if resp.status != 200:
-            await ctx.send("Ошибка при получении данных канала.")
-            return
         js = await resp.json()
+        if resp.status != 200:
+            await ctx.send(f"Ошибка при получении данных канала: {js}")
+            return
         if not js.get("data"):
-            await ctx.send("Не нашёл канал в Twitch API.")
+            await ctx.send("Не нашёл канал.")
             return
         channel_id = js["data"][0]["id"]
 
-    # проверяем фоллов
-    url_follows = "https://api.twitch.tv/helix/users/follows"
-    params = {"from_id": user_id, "to_id": channel_id}
+    # --- проверяем фолловера ---
+    url_follows = "https://api.twitch.tv/helix/channels/followers"
+    params = {"broadcaster_id": channel_id, "user_id": user_id}
 
     async with session.get(url_follows, headers=headers, params=params) as resp:
-        if resp.status != 200:
-            await ctx.send("Ошибка при проверке фолловеров.")
-            return
         js = await resp.json()
+        if resp.status != 200:
+            await ctx.send(f"Ошибка при проверке фолловеров: {js}")
+            return
+
         data = js.get("data", [])
         if not data:
-            await ctx.send(f"@{user}, похоже ты ещё не зафолловлен на канал! Поддержи стримера ❤️")
+            await ctx.send(f"@{user}, похоже ты ещё не зафолловлен! Поддержи стримера ❤️")
             return
 
         followed_at = data[0]["followed_at"]
