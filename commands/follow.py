@@ -24,16 +24,11 @@ async def run(ctx):
     user = ctx.author.name
 
     async def get_app_access_token(session):
-        """
-        Получает App Access Token (client_credentials).
-        Возвращает (token, expires_in) или (None, 0) при ошибке.
-        """
-        url = "https://id.twitch.tv/oauth2/authorize"
+        url = "https://id.twitch.tv/oauth2/token"
         data = {
             "client_id": CLIENT_ID,
-            "redirect_uri": "http://localhost:3000",
-            "response_type": token,
-            "scope": "moderator:read:followers"
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "client_credentials",
         }
         try:
             async with session.post(url, data=data) as resp:
@@ -93,7 +88,18 @@ async def run(ctx):
         delta = datetime.datetime.now(datetime.timezone.utc) - dt_follow
 
         days = delta.days
+        months, days = divmod(days, 30)
         hours, rem = divmod(delta.seconds, 3600)
         minutes, _ = divmod(rem, 60)
 
-        await ctx.send(f"@{user}, ты фолловишь канал уже {days} дн. {hours} ч. {minutes} мин!")
+        msg_parts = []
+        if months > 0:
+            msg_parts.append(f"{months} мес.")
+        if days > 0:
+            msg_parts.append(f"{days} дн.")
+        if hours > 0:
+            msg_parts.append(f"{hours} ч.")
+        if minutes > 0:
+            msg_parts.append(f"{minutes} мин.")
+
+        await ctx.send(f"@{user}, ты фолловишь канал уже {' '.join(msg_parts)}!")
